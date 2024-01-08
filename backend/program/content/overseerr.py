@@ -34,7 +34,7 @@ class Overseerr:
             logger.debug("Overseerr is set to disabled.")
             return False
         if self.settings.api_key == "" or len(self.settings.api_key) != 68:
-            logger.error("Overseerr api key is not set.")
+            logger.error("Overseerr api key is not set or invalid.")
             return False
         try:
             response = ping(
@@ -43,8 +43,8 @@ class Overseerr:
                 timeout=15,
             )
             return response.ok
-        except Exception:
-            logger.error("Overseerr url is not reachable.")
+        except Exception as e:
+            logger.error("Overseerr url is not reachable: %s", e)
             return False
 
     def run(self):
