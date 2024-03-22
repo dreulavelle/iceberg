@@ -1,9 +1,11 @@
 """ Jackett scraper module """
+from program.media.item import Show
+from program.settings.manager import settings_manager
+from program.versions.parser import ParsedTorrents, Torrent, check_title_match
+from program.versions.rank_models import models
 from requests import ReadTimeout, RequestException
 from utils.logger import logger
-from program.settings.manager import settings_manager
-from utils.parser import parser
-from utils.request import RateLimitExceeded, get, RateLimiter, ping
+from utils.request import RateLimiter, RateLimitExceeded, get, ping
 
 
 class Jackett:
@@ -13,6 +15,8 @@ class Jackett:
         self.key = "jackett"
         self.api_key = None
         self.settings = settings_manager.settings.scraping.jackett
+        self.rank_profile = settings_manager.settings.ranking.profile
+        self.ranking_model = None
         self.initialized = self.validate()
         if not self.initialized and not self.api_key:
             return
@@ -32,54 +36,40 @@ class Jackett:
             self.api_key = self.settings.api_key
             try:
                 url = f"{self.settings.url}/api/v2.0/indexers/!status:failing,test:passed/results/torznab?apikey={self.api_key}&cat=2000&t=movie&q=test"
+                self.ranking_model = models.get(self.rank_profile)
                 response = ping(url=url, timeout=60)
                 if response.ok:
                     return True
             except ReadTimeout:
-                return True
+                logger.error("Jackett request timed out. Check your indexers, they may be too slow to respond.")
+                return False
             except Exception as e:
                 logger.error("Jackett failed to initialize with API Key: %s", e)
-                return False
-        if self.settings.url:
-            try:
-                url = f"{self.settings.url}/api/v2.0/server/config"
-                response = get(url=url, retry_if_failed=False, timeout=60)
-                if response.is_ok and response.data.api_key is not None:
-                    self.api_key = response.data.api_key
-                    return True
-                if not response.is_ok:
-                    return False
-            except ReadTimeout:
-                logger.warn("Jackett connection timeout.")
-                return True
-            except Exception as e:
-                logger.error("Jackett failed to initialize: %s", e)
                 return False
         logger.info("Jackett is not configured and will not be used.")
         return False
 
     def run(self, item):
-        """Scrape Jackett for the given media items"""
-        if item is None or not self.initialized:
-            return
+        """Scrape the jackett site for the given media items
+        and update the object with scraped streams"""
+        if item is None or isinstance(item, Show):
+            yield item
         try:
             yield self._scrape_item(item)
         except RateLimitExceeded:
             self.minute_limiter.limit_hit()
             logger.warn("Jackett rate limit hit for item: %s", item.log_string)
-            return
         except RequestException as e:
             logger.debug("Jackett request exception: %s", e)
-            return
         except Exception as e:
             logger.error("Jackett failed to scrape item: %s", e)
-            return
+        return item
 
     def _scrape_item(self, item):
         """Scrape the given media item"""
         data, stream_count = self.api_scrape(item)
         if len(data) > 0:
-            item.streams.update(data)
+            item.streams.update(data.torrents)
             logger.debug(
                 "Found %s streams out of %s for %s",
                 len(data),
@@ -90,50 +80,46 @@ class Jackett:
             logger.debug("Could not find streams for %s", item.log_string)
         return item
 
-    def api_scrape(self, item):
+    def api_scrape(self, item) -> tuple[ParsedTorrents, int]:
         """Wrapper for `Jackett` scrape method"""
         # https://github.com/Jackett/Jackett/wiki/Jackett-Categories
         with self.minute_limiter:
             query = ""
             if item.type == "movie":
-                query = f"cat=2000&t=movie&q={item.title}&year{item.aired_at.year}"
+                if not item.aired_at.year:
+                    query = f"cat=2000&t=movie&q={item.title}"
+                else:
+                    query = f"cat=2000&t=movie&q={item.title}&year{item.aired_at.year}"
             if item.type == "season":
-                query = f"cat=5000&t=tvsearch&q={item.parent.title}&season={item.number}"
+                query = (
+                    f"cat=5000&t=tvsearch&q={item.parent.title}&season={item.number}"
+                )
             if item.type == "episode":
                 query = f"cat=5000&t=tvsearch&q={item.parent.parent.title}&season={item.parent.number}&ep={item.number}"
             url = f"{self.settings.url}/api/v2.0/indexers/all/results/torznab?apikey={self.api_key}&{query}"
             with self.second_limiter:
                 response = get(url=url, retry_if_failed=False, timeout=60)
-            if response.is_ok:
-                data = {}
-                streams = response.data["rss"]["channel"].get("item", [])
-                parsed_data_list = [
-                    parser.parse(item, stream.get("title"))
-                    for stream in streams
-                    if not isinstance(stream, str)
-                ]
-                for stream, parsed_data in zip(streams, parsed_data_list):
-                    if parsed_data.get("fetch", True) and parsed_data.get(
-                        "title_match", False
-                    ):
-                        attr = stream.get("torznab:attr", [])
-                        infohash_attr = next(
-                            (a for a in attr if a.get("@name") == "infohash"), None
-                        )
-                        if infohash_attr:
-                            infohash = infohash_attr.get("@value")
-                            data[infohash] = {
-                                "name": stream.get("title"),
-                                "cached": None
-                            }
-                if self.parse_logging:  # For debugging parser large data sets
-                    for parsed_data in parsed_data_list:
-                        logger.debug(
-                            "Jackett Fetch: %s - Parsed item: %s",
-                            parsed_data["fetch"],
-                            parsed_data["string"],
-                        )
-                if data:
-                    item.parsed_data.extend(parsed_data_list)
-                    return data, len(streams)
+            if (
+                not response.is_ok
+                or len(response.data["rss"]["channel"].get("item", [])) <= 0
+            ):
                 return {}, 0
+            streams = response.data["rss"]["channel"].get("item", [])
+            if not streams:
+                return {}, 0
+            scraped_torrents = ParsedTorrents()
+            for stream in streams:
+                attr = stream.get("torznab:attr", [])
+                infohash_attr = next(
+                    (a for a in attr if a.get("@name") == "infohash"), None
+                )
+                if not infohash_attr or check_title_match(item, stream.get("title")):
+                    continue
+                infohash = infohash_attr.get("@value")
+                torrent: Torrent = Torrent(
+                    self.ranking_model, raw_title=stream.get("title"), infohash=infohash
+                )
+                if torrent and torrent.parsed_data.fetch:
+                    scraped_torrents.add_torrent(torrent)
+            scraped_torrents.sort_torrents()
+            return scraped_torrents, len(streams) or 0

@@ -1,7 +1,10 @@
 """Iceberg settings models"""
-from typing import Callable
+
+import re
 from pathlib import Path
-from pydantic import BaseModel, HttpUrl, validator
+from typing import Callable, Dict
+
+from pydantic import BaseModel, Field, field_validator
 from utils import version_file_path
 
 
@@ -21,8 +24,6 @@ class Observable(BaseModel):
             self.__class__._notify_observers()
 
 
-
-
 class DebridModel(Observable):
     api_key: str = ""
 
@@ -38,11 +39,12 @@ class SymlinkModel(Observable):
 class Updatable(Observable):
     update_interval: int = 80
 
-    @validator('update_interval')
+    @field_validator("update_interval")
     def check_update_interval(cls, v):
         if v < (limit := 5):
             raise ValueError(f"update_interval must be at least {limit} seconds")
         return v
+
 
 class PlexLibraryModel(Updatable):
     update_interval: int = 120
@@ -103,7 +105,14 @@ class OrionoidConfig(Observable):
 class TorrentioConfig(Observable):
     enabled: bool = False
     filter: str = "sort=qualitysize%7Cqualityfilter=480p,scr,cam"
-    url: HttpUrl = "https://torrentio.strem.fun"
+    url: str = "https://torrentio.strem.fun"
+
+
+class AnnatarConfig(Observable):
+    enabled: bool = False
+    url: str = "https://annatar.elfhosted.com"
+    limit: int = 20
+    timeout: int = 10
 
 
 class ScraperModel(Observable):
@@ -113,16 +122,70 @@ class ScraperModel(Observable):
     jackett: JackettConfig = JackettConfig()
     orionoid: OrionoidConfig = OrionoidConfig()
     torrentio: TorrentioConfig = TorrentioConfig()
+    annatar: AnnatarConfig = AnnatarConfig()
 
 
-class ParserModel(Observable):
-    highest_quality: bool = False
-    include_4k: bool = False
-    repack_proper: bool = True
-    language: list[str] = ["English"]
+# Version Ranks
+
+
+class CustomRank(BaseModel):
+    enable: bool = False
+    fetch: bool = False
+    rank: int = Field(default=0, ge=-10000, le=10000)
+
+
+class RankingModel(BaseModel):
+    profile: str = "default"
+    require: list[str] = [""]
+    exclude: list[str] = [""]
+    preferred: list[str] = [""]
+    custom_ranks: Dict[str, CustomRank] = {
+        "uhd": CustomRank(fetch=False, rank=100),
+        "fhd": CustomRank(fetch=True, rank=90),
+        "hd": CustomRank(fetch=True, rank=80),
+        "sd": CustomRank(fetch=False, rank=-20),
+        "bluray": CustomRank(fetch=True, rank=80),
+        "hdr": CustomRank(fetch=False, rank=80),
+        "hdr10": CustomRank(fetch=False, rank=90),
+        "dolby_video": CustomRank(fetch=False, rank=-20),
+        "dts_x": CustomRank(fetch=False),
+        "dts_hd": CustomRank(fetch=False),
+        "dts_hd_ma": CustomRank(fetch=False),
+        "atmos": CustomRank(fetch=False),
+        "truehd": CustomRank(fetch=False),
+        "ddplus": CustomRank(fetch=False),
+        "aac": CustomRank(fetch=True, rank=70),
+        "ac3": CustomRank(fetch=True, rank=50),
+        "remux": CustomRank(fetch=False, rank=-1000),
+        "webdl": CustomRank(fetch=True, rank=90),
+        "repack": CustomRank(fetch=True, rank=5),
+        "proper": CustomRank(fetch=True, rank=4),
+        "dubbed": CustomRank(fetch=True, rank=4),
+        "subbed": CustomRank(fetch=True, rank=2),
+        "av1": CustomRank(fetch=False, rank=0),
+    }
+
+    def compile_patterns(self) -> None:
+        """Compile regex patterns."""
+        self.require = [
+            re.compile(pattern, re.IGNORECASE)
+            for pattern in self.require
+            if pattern and pattern.strip()
+        ]
+        self.exclude = [
+            re.compile(pattern, re.IGNORECASE)
+            for pattern in self.exclude
+            if pattern and pattern.strip()
+        ]
+        self.preferred = [
+            re.compile(pattern, re.IGNORECASE)
+            for pattern in self.preferred
+            if pattern and pattern.strip()
+        ]
 
 
 # Application Settings
+
 
 class IndexerModel(Observable):
     update_interval: int = 60 * 60
@@ -142,7 +205,5 @@ class AppModel(Observable):
     symlink: SymlinkModel = SymlinkModel()
     content: ContentModel = ContentModel()
     scraping: ScraperModel = ScraperModel()
-    parser: ParserModel = ParserModel()
+    ranking: RankingModel = RankingModel()
     indexer: IndexerModel = IndexerModel()
-
-
