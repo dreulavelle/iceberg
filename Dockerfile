@@ -38,11 +38,28 @@ LABEL name="Riven" \
       description="Riven Media Server" \
       url="https://github.com/rivenmedia/riven"
 
+ARG S6_OVERLAY_VERSION=3.2.0.0
+ARG TARGETPLATFORM=linux/amd64 # Set a default
+
+# Install s6 noarch
+ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp
+RUN tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz
+
+# Install arch-specific s6
+RUN \ 
+  case ${TARGETPLATFORM} in \
+    "linux/amd64")  DOWNLOAD_ARCH="x86_64"  ;; \
+    "linux/arm/v7") DOWNLOAD_ARCH="arm"  ;; \
+  esac && \
+  wget https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-${DOWNLOAD_ARCH}.tar.xz -P /tmp \
+  tar -C / -Jxpf /tmp/s6-overlay-x86_64.tar.xz \
+  rm /tmp/s6-overlay-x86_64.tar.xz
+
+
 # Install system dependencies and Node.js
 ENV PYTHONUNBUFFERED=1
 RUN apk add --no-cache \
     curl \
-    fish \
     shadow \
     nodejs \
     npm \
@@ -69,9 +86,6 @@ RUN pip install poetry==1.8.3
 # Create user and group
 RUN addgroup -g 1000 riven && \
     adduser -u 1000 -G riven -h /home/riven -s /usr/bin/fish -D riven
-
-# Create fish config directory
-RUN mkdir -p /home/riven/.config/fish
 
 # Set environment variable to force color output
 ENV FORCE_COLOR=1
@@ -101,7 +115,4 @@ RUN chmod +x /riven/entrypoint.sh
 # Set correct permissions for the riven user
 RUN chown -R riven:riven /home/riven/.config /riven
 
-# Switch to fish shell
-SHELL ["fish", "--login"]
-
-ENTRYPOINT ["fish", "/riven/entrypoint.sh"]
+ENTRYPOINT ["/init"]
